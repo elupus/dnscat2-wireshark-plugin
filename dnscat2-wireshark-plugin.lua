@@ -13,9 +13,8 @@ field_dns_resp_txt = Field.new("dns.txt")
 
 
 fields = {}
-fields.request = ProtoField.none("dnscat2.request","Request Packet")
-fields.response = ProtoField.none("dnscat2.response","Response Packet")
 
+fields.packet_raw = ProtoField.bytes("dnscat2.packet_raw","Packet")
 fields.packet_id = ProtoField.uint16("dnscat2.packet_id", "Id")
 fields.packet_type = ProtoField.uint8("dnscat2.packet_type", "Type", base.HEX, {
     [0] = "SYN",
@@ -47,6 +46,8 @@ fields.enc_auth = ProtoField.bytes("dnscat2.enc.auth", "Auth")
 
 proto.fields = fields
 
+local sessions = {}
+
 function extract_from_name(data)
     -- make sure it's a string
     data = tostring(data)
@@ -64,26 +65,48 @@ function extract_from_name(data)
     return ByteArray.tvb(ByteArray.new(data))
 end
 
-function parse_packet(parent, tvb)
+function parse_packet(parent, tvb, pinfo, request)
 
     local packet_id   = tvb(0, 2)
     local packet_type = tvb(2, 1)
     local session_id  = tvb(3, 2)
 
+    parent:add(fields.packet_raw, tvb())
     parent:add(fields.packet_id, packet_id)
     parent:add(fields.packet_type, packet_type)
     parent:add(fields.session_id, session_id)
 
+    if not sessions[session_id] then
+        sessions[session_id] = {}
+        sessions[session_id].request = {}
+        sessions[session_id].response = {}
+    end
+    local session
+
+    if request then
+        session = sessions[session_id].request
+    else
+        session = sessions[session_id].response
+    end
+
+    local seq
+    local ack
+    local len = 0
+
     if packet_type:uint() == 0 then
         local syn = parent:add(fields.syn, tvb(5))
-        syn:add(fields.syn_seq,     tvb(5, 2))
+        seq = tvb(5, 2)
+        syn:add(fields.syn_seq,     seq)
         syn:add(fields.syn_options, tvb(7, 2))
         syn:add(fields.syn_name,    tvb(9))
     elseif packet_type:uint() == 1 then
         local msg = parent:add(fields.msg, tvb(5))
-        msg:add(fields.msg_seq,  tvb(5, 2))
-        msg:add(fields.msg_ack,  tvb(7, 2))
-        if tvb:len() > 9 then
+        seq = tvb(5, 2)
+        ack = tvb(7, 2)
+        len = tvb:len() - 9
+        msg:add(fields.msg_seq, seq)
+        msg:add(fields.msg_ack, ack)
+        if len > 0 then
             msg:add(fields.msg_data, tvb(9))
         end
     elseif packet_type:uint() == 2 then
@@ -99,6 +122,18 @@ function parse_packet(parent, tvb)
             enc:add(fields.enc_auth, tvb(9))
         end
     end
+
+    if seq then
+        if session.seq == nil then
+            session.seq = seq:uint()
+        else
+            if not seq:uint() == session.seq then
+                print ("Sequence error")
+            end
+            session.seq = seq:uint() + len    
+        end
+    end
+
 end
 
 function proto.dissector(buffer, pinfo, tree)
@@ -107,14 +142,9 @@ function proto.dissector(buffer, pinfo, tree)
         return
     end
 
-    local subtree = tree:add(proto, "dnscat2")
-
-    local tvb = extract_from_name(dns_qry_name)
-    local request = subtree:add(fields.request, tvb())
-    parse_packet(request, tvb)
- 
     local response_type = field_dns_resp_type()
     if response_type then
+        local subtree = tree:add(proto, "dnscat2 (response)")
         response_type = tostring(response_type)
         local tvb
         local response
@@ -127,9 +157,12 @@ function proto.dissector(buffer, pinfo, tree)
         end
 
         if tvb then
-            response = subtree:add(fields.response, tvb())
-            parse_packet(response, tvb)
+            parse_packet(subtree, tvb, pinfo, false)
         end
+    else
+        local subtree = tree:add(proto, "dnscat2 (request)")
+        local tvb = extract_from_name(dns_qry_name)
+        parse_packet(subtree, tvb, pinfo, true)
     end
 
 end
