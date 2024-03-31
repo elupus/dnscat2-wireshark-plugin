@@ -1,7 +1,7 @@
-print("DNSCat2 dissector loading")
+print("dnscat2 dissector loading")
 
 
-proto = Proto("DNSCat2", "DNSCat2 dissector")
+proto = Proto("dnscat2", "dnscat2 dissector")
 
 
 field_dns_qry_name = Field.new("dns.qry.name")
