@@ -48,7 +48,7 @@ function proto.dissector(buffer, pinfo, tree)
         return
     end
 
-    local subtree = tree:add(proto, "DNSCat2")
+    local subtree = tree:add(proto, "dnscat2")
 
     data = tostring(dns_qry_name)
     --data = dns_qry_name
