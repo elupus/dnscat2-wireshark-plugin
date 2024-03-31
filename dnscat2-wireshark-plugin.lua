@@ -24,6 +24,7 @@ fields.packet_type = ProtoField.uint8("dnscat2.packet_type", "Type", base.HEX, {
     [0xff] = "PING",
 })
 fields.session_id = ProtoField.uint16("dnscat2.session_id", "Session")
+fields.packet_req = ProtoField.bool("dnscat2.packet_req","Request")
 
 fields.msg = ProtoField.none("dnscat2.msg", "Msg")
 fields.msg_seq = ProtoField.uint16("dnscat2.msg.seq", "Seq")
@@ -75,6 +76,7 @@ function parse_packet(parent, tvb, pinfo, request)
     parent:add(fields.packet_raw, tvb())
     parent:add(fields.packet_id, packet_id)
     parent:add(fields.packet_type, packet_type)
+    parent:add(fields.packet_req, request)
     parent:add(fields.session_id, session_id)
 
     if not sessions[session_id:uint()] then
