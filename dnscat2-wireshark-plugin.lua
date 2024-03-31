@@ -28,6 +28,7 @@ fields.session_id = ProtoField.uint16("dnscat2.session_id", "Session")
 fields.msg = ProtoField.none("dnscat2.msg", "Msg")
 fields.msg_seq = ProtoField.uint16("dnscat2.msg.seq", "Seq")
 fields.msg_ack = ProtoField.uint16("dnscat2.msg.ack", "Ack")
+fields.msg_ack_for = ProtoField.framenum("dnscat2.msg.ack_for", "Ack for", base.NONE, frametype.ACK)
 fields.msg_data = ProtoField.bytes("dnscat2.msg.data","Data")
 
 fields.syn = ProtoField.none("dnscat2.syn", "Syn")
@@ -76,42 +77,60 @@ function parse_packet(parent, tvb, pinfo, request)
     parent:add(fields.packet_type, packet_type)
     parent:add(fields.session_id, session_id)
 
-    if not sessions[session_id] then
-        sessions[session_id] = {}
-        sessions[session_id].request = {}
-        sessions[session_id].response = {}
+    if not sessions[session_id:uint()] then
+        sessions[session_id:uint()] = {}
+        sessions[session_id:uint()].request = {}
+        sessions[session_id:uint()].response = {}
     end
     local session
+    local peer
 
     if request then
-        session = sessions[session_id].request
+        session = sessions[session_id:uint()].request
+        peer = sessions[session_id:uint()].response
     else
-        session = sessions[session_id].response
+        session = sessions[session_id:uint()].response
+        peer = sessions[session_id:uint()].request
     end
-
-    local seq
-    local ack
-    local len = 0
 
     if packet_type:uint() == 0 then
         local syn = parent:add(fields.syn, tvb(5))
-        seq = tvb(5, 2)
+        local seq = tvb(5, 2)
         syn:add(fields.syn_seq,     seq)
         syn:add(fields.syn_options, tvb(7, 2))
         syn:add(fields.syn_name,    tvb(9))
+
+        session.seq = seq
+        session.pkt = {}
+
     elseif packet_type:uint() == 1 then
         local msg = parent:add(fields.msg, tvb(5))
-        seq = tvb(5, 2)
-        ack = tvb(7, 2)
-        len = tvb:len() - 9
+        local seq = tvb(5, 2)
+        local ack = tvb(7, 2)
+        local len = tvb:len() - 9
         msg:add(fields.msg_seq, seq)
         msg:add(fields.msg_ack, ack)
         if len > 0 then
             msg:add(fields.msg_data, tvb(9))
         end
+
+        if not seq:uint() == session.seq then
+            msg:add_expert_info(PI_MALFORMED, PI_ERROR, "sequence errer!")
+        end
+        session.seq = seq:uint() + len
+        session.pkt[session.seq] = pinfo.number
+
+        local ack_for = peer.pkt[ack:uint()]
+        if peer.pkt[ack:uint()] then
+            msg:add(fields.msg_ack_for, ack_for)
+        end
+
     elseif packet_type:uint() == 2 then
         local fin = parent:add(fields.fin, tvb(5))
         fin:add(fields.fin_reason,  tvb(5))
+
+        session.seq = nil
+
     elseif packet_type:uint() == 3 then
         local enc = parent:add(fields.enc, tvb(5))
         enc:add(fields.enc_subtype,  tvb(5, 2))
@@ -120,17 +139,6 @@ function parse_packet(parent, tvb, pinfo, request)
             enc:add(fields.enc_init, tvb(9))
         elseif tvb(5, 2):uint() == 1 then
             enc:add(fields.enc_auth, tvb(9))
-        end
-    end
-
-    if seq then
-        if session.seq == nil then
-            session.seq = seq:uint()
-        else
-            if not seq:uint() == session.seq then
-                print ("Sequence error")
-            end
-            session.seq = seq:uint() + len    
         end
     end
 
