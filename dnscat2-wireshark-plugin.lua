@@ -223,7 +223,7 @@ function parse_packet(parent, tvb, pinfo, request)
 
         conn.seq = seq
 
-        pinfo.cols.info:append(" N:" .. name:string())
+        pinfo.cols.info:append(": " .. name:string())
 
     elseif packet_type:uint() == 1 then
         local msg = parent:add(fields.msg, tvb(5))
