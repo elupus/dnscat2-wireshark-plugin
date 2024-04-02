@@ -14,15 +14,22 @@ field_dns_resp_txt = Field.new("dns.txt")
 
 fields = {}
 
-fields.packet_raw = ProtoField.bytes("dnscat2.packet_raw","Packet")
-fields.packet_id = ProtoField.uint16("dnscat2.packet_id", "Id")
-fields.packet_type = ProtoField.uint8("dnscat2.packet_type", "Type", base.HEX, {
+local packet_type_table = {
     [0] = "SYN",
     [1] = "MSG",
     [2] = "FIN",
     [3] = "ENC",
     [0xff] = "PING",
-})
+}
+
+local request_type_table = {
+    [true] = "Q",
+    [false] = "R"
+}
+
+fields.packet_raw = ProtoField.bytes("dnscat2.packet_raw","Packet")
+fields.packet_id = ProtoField.uint16("dnscat2.packet_id", "Id")
+fields.packet_type = ProtoField.uint8("dnscat2.packet_type", "Type", base.HEX, packet_type_table)
 fields.session_id = ProtoField.uint16("dnscat2.session_id", "Session")
 fields.packet_req = ProtoField.bool("dnscat2.packet_req","Request")
 
@@ -48,7 +55,8 @@ fields.enc_auth = ProtoField.bytes("dnscat2.enc.auth", "Auth")
 
 fields.cmd = ProtoField.none("dnscat2.cmd", "Command")
 fields.cmd_packed_id = ProtoField.uint16("dnscat2.cmd.packed_id", "Packed Id", base.HEX)
-fields.cmd_command_id = ProtoField.uint16("dnscat2.cmd.command_id", "Command", base.HEX, {
+
+local command_id_table = {
     [0] = "Ping",
     [1] = "Shell",
     [2] = "Exec",
@@ -56,7 +64,9 @@ fields.cmd_command_id = ProtoField.uint16("dnscat2.cmd.command_id", "Command", b
     [4] = "Uplaod",
     [5] = "Shutdown",
     [6] = "Delay"
-})
+}
+
+fields.cmd_command_id = ProtoField.uint16("dnscat2.cmd.command_id", "Command", base.HEX, command_id_table)
 fields.cmd_data = ProtoField.bytes("dnscat2.cmd.data", "Data")
 
 fields.segment = ProtoField.none("dnscat2.segment", "Segment")
@@ -85,7 +95,27 @@ function extract_from_name(data)
     return ByteArray.tvb(ByteArray.new(data))
 end
 
-function parse_msg(parent, conn, tvb, pinfo)    
+function parse_cmd(parent, conn, tvb, pinfo, info)
+    local cmd = parent:add(fields.cmd, tvb())
+    local packed_id = tvb(0, 2)
+    local command_id = tvb(2, 2)
+    local data = tvb(4)
+    cmd:add(fields.cmd_packed_id, packed_id)
+    cmd:add(fields.cmd_command_id, command_id)
+    cmd:add(fields.cmd_data, data)
+
+    local command = command_id:uint()
+    pinfo.cols.info:append(": " .. command_id_table[command_id:uint()])
+    if bit32.band(packed_id:uint(), 0x8000) == 0 then
+        if command == 3 then
+            pinfo.cols.info:append(": " .. data:string():gsub("[\n\r]", " "))
+        end
+    else
+        pinfo.cols.info:append(" Response: ...")
+    end
+end
+
+function parse_msg(parent, conn, tvb, pinfo, info)    
 
     local prev = conn.pkt.prev
     local pkt = conn.pkt
@@ -118,10 +148,9 @@ function parse_msg(parent, conn, tvb, pinfo)
         end
         data:prepend(cur.data)
         tvb = data:tvb()
-        local cmd = parent:add(fields.cmd, tvb())
-        cmd:add(fields.cmd_packed_id, tvb(0, 2))
-        cmd:add(fields.cmd_command_id, tvb(2, 2))
-        cmd:add(fields.cmd_data, tvb(4))
+        parse_cmd(parent, conn, tvb, pinfo, info)
+    else
+        pinfo.cols.info:append(": Segment")
     end
 end
 
@@ -164,6 +193,8 @@ function parse_packet(parent, tvb, pinfo, request)
         sessions[session_id:uint()] = session
     end
 
+    pinfo.cols.info = request_type_table[request] .. ": " .. packet_type_table[packet_type:uint()]
+
     local conn
     local peer
     if request then
@@ -185,11 +216,14 @@ function parse_packet(parent, tvb, pinfo, request)
     if packet_type:uint() == 0 then
         local syn = parent:add(fields.syn, tvb(5))
         local seq = tvb(5, 2)
+        local name = tvb(9)
         syn:add(fields.syn_seq,     seq)
         syn:add(fields.syn_options, tvb(7, 2))
         syn:add(fields.syn_name,    tvb(9))
 
         conn.seq = seq
+
+        pinfo.cols.info:append(" N:" .. name:string())
 
     elseif packet_type:uint() == 1 then
         local msg = parent:add(fields.msg, tvb(5))
@@ -198,9 +232,10 @@ function parse_packet(parent, tvb, pinfo, request)
         local len = tvb:len() - 9
         msg:add(fields.msg_seq, seq)
         msg:add(fields.msg_ack, ack)
+
         if len > 0 then
             msg:add(fields.msg_data, tvb(9))
-            parse_msg(parent, conn, tvb(9):tvb(), pinfo)
+            parse_msg(parent, conn, tvb(9):tvb(), pinfo, info)
         end
 
         if not seq:uint() == conn.seq then
@@ -214,12 +249,12 @@ function parse_packet(parent, tvb, pinfo, request)
             msg:add(fields.msg_ack_for, ack_for)
         end
 
-
     elseif packet_type:uint() == 2 then
         local fin = parent:add(fields.fin, tvb(5))
         fin:add(fields.fin_reason,  tvb(5))
 
         conn.seq = nil
+        pinfo.cols.info = info
 
     elseif packet_type:uint() == 3 then
         local enc = parent:add(fields.enc, tvb(5))
@@ -231,7 +266,7 @@ function parse_packet(parent, tvb, pinfo, request)
             enc:add(fields.enc_auth, tvb(9))
         end
     end
-
+    
 end
 
 function proto.dissector(buffer, pinfo, tree)
@@ -239,6 +274,8 @@ function proto.dissector(buffer, pinfo, tree)
     if not dns_qry_name then
         return
     end
+
+    pinfo.cols.protocol = "DNSCAT2"
 
     local response_type = field_dns_resp_type()
     if response_type then
