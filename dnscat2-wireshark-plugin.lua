@@ -37,12 +37,15 @@ fields.msg = ProtoField.none("dnscat2.msg", "Msg")
 fields.msg_seq = ProtoField.uint16("dnscat2.msg.seq", "Seq")
 fields.msg_ack = ProtoField.uint16("dnscat2.msg.ack", "Ack")
 fields.msg_ack_for = ProtoField.framenum("dnscat2.msg.ack_for", "Ack for", base.NONE, frametype.ACK)
-fields.msg_data = ProtoField.bytes("dnscat2.msg.data","Data")
+fields.msg_data = ProtoField.string("dnscat2.msg.data","Data")
 
 fields.syn = ProtoField.none("dnscat2.syn", "Syn")
 fields.syn_seq = ProtoField.uint16("dnscat2.syn.seq", "Seq")
 fields.syn_options = ProtoField.uint16("dnscat2.syn.seq", "Options", base.HEX)
 fields.syn_name = ProtoField.string("dnscat2.syn.name", "Name")
+
+SYN_OPT_NAME = 0x01
+SYN_OPT_COMMAND = 0x20
 
 fields.fin = ProtoField.none("dnscat2.fin", "Syn")
 fields.fin_reason = ProtoField.string("dnscat2.fin.reason", "Reason")
@@ -95,7 +98,7 @@ function extract_from_name(data)
     return ByteArray.tvb(ByteArray.new(data))
 end
 
-function parse_cmd(parent, conn, tvb, pinfo, info)
+function parse_cmd_complete(parent, conn, tvb, pinfo)
     local cmd = parent:add(fields.cmd, tvb())
     local packed_id = tvb(0, 2)
     local command_id = tvb(2, 2)
@@ -115,40 +118,43 @@ function parse_cmd(parent, conn, tvb, pinfo, info)
     end
 end
 
-function parse_msg(parent, conn, tvb, pinfo, info)    
+function parse_cmd(parent, conn, tvb, pinfo)    
 
     local prev = conn.pkt.prev
     local pkt = conn.pkt
 
-    local seg = parent:add(fields.segment, tvb())
-
-    if prev.pos + prev.data:len() >= prev.len then
-        seg:add(fields.segment_data, tvb(4))
-
+    if pkt.seq_next == prev.seq_next then
+        pkt.len = prev.len
+        pkt.pos = prev.pos
+        pkt.data = prev.data
+    elseif prev.pos + prev.data:len() >= prev.len then
         pkt.len = tvb(0, 4):uint()
         pkt.pos = 0
         pkt.data = tvb(4):bytes()
     else
-        seg:add(fields.segment_data, tvb())
-
         pkt.len = prev.len
         pkt.pos = prev.pos + prev.data:len()
         pkt.data = tvb():bytes()
     end
 
+    local seg = parent:add(fields.segment, tvb())
     seg:add(fields.segment_len, pkt.len)
     seg:add(fields.segment_pos, pkt.pos)
 
     if pkt.pos + pkt.data:len() >= pkt.len then
         local data = ByteArray.new()
-        local cur = pkt
-        while cur.pos > 0 do
-            data:prepend(cur.data)
-            cur = cur.prev
+        data:prepend(pkt.data)
+        while pkt.pos ~= 0 do
+            local seq = pkt.seq_next
+            repeat
+                pkt = pkt.prev
+            until seq ~= pkt.seq_next
+
+            data:prepend(pkt.data)
         end
-        data:prepend(cur.data)
+        
         tvb = data:tvb()
-        parse_cmd(parent, conn, tvb, pinfo, info)
+        parse_cmd_complete(parent, conn, tvb, pinfo)
     else
         pinfo.cols.info:append(": Segment")
     end
@@ -160,6 +166,7 @@ function new_packet(prev)
         pos = 0,
         len = 0,
         data = ByteArray.new(),
+        seq_next = nil,
     }
 end
 
@@ -188,7 +195,8 @@ function parse_packet(parent, tvb, pinfo, request)
     if not session then
         session = {
             request = new_conn(),
-            response = new_conn()
+            response = new_conn(),
+            opt = 0
         }
         sessions[session_id:uint()] = session
     end
@@ -198,11 +206,11 @@ function parse_packet(parent, tvb, pinfo, request)
     local conn
     local peer
     if request then
-        conn = sessions[session_id:uint()].request
-        peer = sessions[session_id:uint()].response
+        conn = session.request
+        peer = session.response
     else
-        conn = sessions[session_id:uint()].response
-        peer = sessions[session_id:uint()].request
+        conn = session.response
+        peer = session.request
     end
 
     if pinfo.visited then
@@ -216,13 +224,16 @@ function parse_packet(parent, tvb, pinfo, request)
     if packet_type:uint() == 0 then
         local syn = parent:add(fields.syn, tvb(5))
         local seq = tvb(5, 2)
+        local opt = tvb(7, 2)
         local name = tvb(9)
         syn:add(fields.syn_seq,     seq)
-        syn:add(fields.syn_options, tvb(7, 2))
+        syn:add(fields.syn_options, opt)
         syn:add(fields.syn_name,    tvb(9))
 
-        conn.seq = seq
-
+        conn.pkt.seq_next = seq:uint()
+        if request then
+            session.opt = opt:uint()
+        end
         pinfo.cols.info:append(": " .. name:string())
 
     elseif packet_type:uint() == 1 then
@@ -233,17 +244,21 @@ function parse_packet(parent, tvb, pinfo, request)
         msg:add(fields.msg_seq, seq)
         msg:add(fields.msg_ack, ack)
 
+        conn.pkt.seq_next = seq:uint() + len
+        if conn.pkt.seq_next == conn.pkt.prev.seq_next then
+            msg:add_expert_info(PI_SEQUENCE, PI_NOTE, "sequence resend")
+        elseif seq:uint() ~= conn.pkt.prev.seq_next then
+            msg:add_expert_info(PI_SEQUENCE, PI_ERROR, "sequence error!")
+        end
+
         if len > 0 then
             msg:add(fields.msg_data, tvb(9))
-            parse_msg(parent, conn, tvb(9):tvb(), pinfo, info)
+            if bit32.band(session.opt, SYN_OPT_COMMAND) ~= 0 then
+                parse_cmd(parent, conn, tvb(9):tvb(), pinfo)
+            end
         end
 
-        if not seq:uint() == conn.seq then
-            msg:add_expert_info(PI_MALFORMED, PI_ERROR, "sequence errer!")
-        end
-        conn.seq = seq:uint() + len
-        conn.seq_seen[conn.seq] = pinfo.number
-
+        conn.seq_seen[conn.pkt.seq_next] = pinfo.number
         local ack_for = peer.seq_seen[ack:uint()]
         if ack_for then
             msg:add(fields.msg_ack_for, ack_for)
@@ -254,7 +269,6 @@ function parse_packet(parent, tvb, pinfo, request)
         fin:add(fields.fin_reason,  tvb(5))
 
         conn.seq = nil
-        pinfo.cols.info = info
 
     elseif packet_type:uint() == 3 then
         local enc = parent:add(fields.enc, tvb(5))
