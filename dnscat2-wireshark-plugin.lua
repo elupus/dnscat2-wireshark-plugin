@@ -155,8 +155,6 @@ function parse_cmd(parent, conn, tvb, pinfo)
         
         tvb = data:tvb()
         parse_cmd_complete(parent, conn, tvb, pinfo)
-    else
-        pinfo.cols.info:append(": Segment")
     end
 end
 
@@ -252,6 +250,7 @@ function parse_packet(parent, tvb, pinfo, request)
         end
 
         if len > 0 then
+            pinfo.cols.info:append(": Data")
             msg:add(fields.msg_data, tvb(9))
             if bit32.band(session.opt, SYN_OPT_COMMAND) ~= 0 then
                 parse_cmd(parent, conn, tvb(9):tvb(), pinfo)
